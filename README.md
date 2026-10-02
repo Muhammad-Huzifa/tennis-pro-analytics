@@ -7,8 +7,8 @@ A video-analysis prototype combining a supplied YOLO ball detector with MediaPip
 Use Python 3.11, clone the project, and create an environment:
 
 ```bash
-git clone https://github.com/Muhammad-Huzifa/tennis-pro-analytics.git
-cd tennis-pro-analytics
+git clone https://github.com/Muhammad-Huzifa/tennis-video-analytics.git
+cd tennis-video-analytics
 python -m venv .venv
 ```
 

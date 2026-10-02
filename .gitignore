@@ -1,7 +1,8 @@
+.venv/
 __pycache__/
-*.pyc
-*.mp4
+*.py[cod]
 *.pt
-*.json
-*.csv
-.DS_Store
+outputs/*
+!outputs/README.md
+tennis_analysis*.json
+tennis_analysis*.csv

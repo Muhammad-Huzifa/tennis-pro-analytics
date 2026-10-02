@@ -4,6 +4,8 @@ import mediapipe as mp
 from ultralytics import YOLO
 import yt_dlp
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import math
 import json
 import csv
@@ -322,9 +324,25 @@ class TennisProAnalyzer:
         return json_file, csv_file
     
     def process_video(self, video_url: str, output_file: str = "Tennis_Pro_Analysis.mp4"):
+        output = Path(output_file).resolve()
+        local_source = Path(video_url)
+        if local_source.is_file() and local_source.resolve() == output:
+            raise ValueError("Input and output video paths must differ.")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if local_source.is_file():
+                return self._process_video(str(local_source.resolve()), str(output))
+            with TemporaryDirectory(prefix="tennis-video-") as folder:
+                downloaded = self.download_video(video_url, str(Path(folder) / "input.mp4"))
+                return self._process_video(downloaded, str(output))
+        finally:
+            if self.pose_detector is not None:
+                self.pose_detector.close()
+
+    def _process_video(self, video_url: str, output_file: str):
         # Initialize
         self.initialize_models()
-        input_video = self.download_video(video_url)
+        input_video = video_url
         
         # Session metadata
         self.session.video_source = video_url
@@ -335,9 +353,12 @@ class TennisProAnalyzer:
         
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        if not cap.isOpened() or w < 640 or h < 480 or not math.isfinite(fps) or fps <= 0:
+            cap.release()
+            raise ValueError("Use a readable video of at least 640x480 with a valid frame rate.")
         self.session.fps = fps
         self.session.resolution = (w, h)
         self.session.duration_seconds = total_frames / fps if fps > 0 else 0
@@ -346,6 +367,10 @@ class TennisProAnalyzer:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_file, fourcc, fps, (w * 2, h))
         
+        if not out.isOpened():
+            cap.release()
+            out.release()
+            raise OSError("Could not open the output video writer.")
         print(f"\n🎬 Processing Video...")
         print(f"   Resolution: {w}x{h} @ {fps}fps")
         print(f"   Total Frames: {total_frames}")
@@ -355,114 +380,114 @@ class TennisProAnalyzer:
         speed_category = "---"
         all_speeds = []
         
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            self.frame_count += 1
-            self.session.rally_stats.total_frames = self.frame_count
-            
-            # Progress indicator
-            if self.frame_count % 30 == 0:
-                progress = (self.frame_count / total_frames) * 100
-                print(f"   Processing: {progress:.1f}% ({self.frame_count}/{total_frames})", 
-                      end='\r')
-            
-            # === DETECT PLAYER ===
-            player_result = self.detect_player(frame)
-            player_pos, landmarks = player_result if player_result else (None, None)
-            
-            if player_pos:
-                self.player_history.append(player_pos)
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                # Update player metrics
-                if len(self.player_history) >= 2:
-                    dist = self.calculate_speed(
-                        self.player_history[-2], 
-                        self.player_history[-1]
-                    )
-                    self.session.player_metrics.total_distance += dist
-                    self.session.player_metrics.movement_samples += 1
+                self.frame_count += 1
+                self.session.rally_stats.total_frames = self.frame_count
+                
+                # Progress indicator
+                if self.frame_count % 30 == 0 and total_frames > 0:
+                    progress = (self.frame_count / total_frames) * 100
+                    print(f"   Processing: {progress:.1f}% ({self.frame_count}/{total_frames})", 
+                          end='\r')
+                
+                # === DETECT PLAYER ===
+                player_result = self.detect_player(frame)
+                player_pos, landmarks = player_result if player_result else (None, None)
+                
+                if player_pos:
+                    self.player_history.append(player_pos)
                     
-                    if dist > self.session.player_metrics.max_speed:
-                        self.session.player_metrics.max_speed = dist
-            
-            # === DETECT BALL ===
-            ball_pos = self.detect_ball(frame)
-            
-            if ball_pos:
-                self.session.rally_stats.ball_detections += 1
+                    # Update player metrics
+                    if len(self.player_history) >= 2:
+                        dist = self.calculate_speed(
+                            self.player_history[-2], 
+                            self.player_history[-1]
+                        )
+                        self.session.player_metrics.total_distance += dist
+                        self.session.player_metrics.movement_samples += 1
+                        
+                        if dist > self.session.player_metrics.max_speed:
+                            self.session.player_metrics.max_speed = dist
                 
-                # Calculate speed
-                if len(self.ball_history) > 0:
-                    prev = self.ball_history[-1]
-                    current_speed = self.calculate_speed(
-                        (prev.x, prev.y), ball_pos
+                # === DETECT BALL ===
+                ball_pos = self.detect_ball(frame)
+                
+                if ball_pos:
+                    self.session.rally_stats.ball_detections += 1
+                    
+                    # Calculate speed
+                    if len(self.ball_history) > 0:
+                        prev = self.ball_history[-1]
+                        current_speed = self.calculate_speed(
+                            (prev.x, prev.y), ball_pos
+                        )
+                    else:
+                        current_speed = 0.0
+                    
+                    all_speeds.append(current_speed)
+                    
+                    # Update max speed
+                    if current_speed > self.session.rally_stats.max_ball_speed:
+                        self.session.rally_stats.max_ball_speed = current_speed
+                    
+                    # Update average speed
+                    self.session.rally_stats.avg_ball_speed = np.mean(all_speeds)
+                    
+                    # Get speed category
+                    speed_category, _ = self.viz.get_speed_category(current_speed)
+                    
+                    # Update speed distribution
+                    self.session.rally_stats.speed_distribution[
+                        speed_category.lower()
+                    ] += 1
+                    
+                    # Update court zones
+                    h_zone, v_zone = self.get_court_zone(ball_pos[0], ball_pos[1], w, h)
+                    self.session.rally_stats.court_zones_hit[h_zone] += 1
+                    self.session.rally_stats.court_zones_hit[v_zone] += 1
+                    
+                    # Create ball position record
+                    ball_record = BallPosition(
+                        frame_id=self.frame_count,
+                        x=ball_pos[0],
+                        y=ball_pos[1],
+                        speed=current_speed,
+                        speed_category=speed_category,
+                        timestamp=self.frame_count / fps
                     )
-                else:
-                    current_speed = 0.0
+                    
+                    self.ball_history.append(ball_record)
+                    self.session.ball_trajectory.append(ball_record)
                 
-                all_speeds.append(current_speed)
+                # === CREATE VISUALIZATIONS ===
                 
-                # Update max speed
-                if current_speed > self.session.rally_stats.max_ball_speed:
-                    self.session.rally_stats.max_ball_speed = current_speed
+                # Analysis Canvas
+                analysis_canvas = self.create_analysis_canvas(frame, landmarks)
                 
-                # Update average speed
-                self.session.rally_stats.avg_ball_speed = np.mean(all_speeds)
+                # Clone frame for overlay
+                overlay_frame = frame.copy()
                 
-                # Get speed category
-                speed_category, _ = self.viz.get_speed_category(current_speed)
+                # Add analytics overlay to original frame
+                self.draw_analytics_overlay(overlay_frame, current_speed, speed_category)
                 
-                # Update speed distribution
-                self.session.rally_stats.speed_distribution[
-                    speed_category.lower()
-                ] += 1
+                # Add label to analysis canvas
+                cv2.putText(analysis_canvas, "TRAJECTORY ANALYSIS", (30, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1,
+                           self.viz.COLORS['primary'], 2)
                 
-                # Update court zones
-                h_zone, v_zone = self.get_court_zone(ball_pos[0], ball_pos[1], w, h)
-                self.session.rally_stats.court_zones_hit[h_zone] += 1
-                self.session.rally_stats.court_zones_hit[v_zone] += 1
+                # Combine frames side by side
+                combined = np.hstack((overlay_frame, analysis_canvas))
                 
-                # Create ball position record
-                ball_record = BallPosition(
-                    frame_id=self.frame_count,
-                    x=ball_pos[0],
-                    y=ball_pos[1],
-                    speed=current_speed,
-                    speed_category=speed_category,
-                    timestamp=self.frame_count / fps
-                )
-                
-                self.ball_history.append(ball_record)
-                self.session.ball_trajectory.append(ball_record)
-            
-            # === CREATE VISUALIZATIONS ===
-            
-            # Analysis Canvas
-            analysis_canvas = self.create_analysis_canvas(frame, landmarks)
-            
-            # Clone frame for overlay
-            overlay_frame = frame.copy()
-            
-            # Add analytics overlay to original frame
-            self.draw_analytics_overlay(overlay_frame, current_speed, speed_category)
-            
-            # Add label to analysis canvas
-            cv2.putText(analysis_canvas, "TRAJECTORY ANALYSIS", (30, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1,
-                       self.viz.COLORS['primary'], 2)
-            
-            # Combine frames side by side
-            combined = np.hstack((overlay_frame, analysis_canvas))
-            
-            out.write(combined)
-        
-        # Cleanup
-        cap.release()
-        out.release()
-        
+                out.write(combined)
+        finally:
+            cap.release()
+            out.release()
+
         # Calculate final player metrics
         if self.session.player_metrics.movement_samples > 0:
             self.session.player_metrics.avg_speed = (
